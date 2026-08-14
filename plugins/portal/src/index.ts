@@ -689,12 +689,16 @@ async function telemetryLiveOffice(req: IncomingMessage, res: ServerResponse): P
     };
     const [projectsBody, cronsBody] = await Promise.all([
       get(`/v1/projects?principalId=${encodeURIComponent(TELEMETRY_PRINCIPAL)}`),
-      get("/v1/crons"),
+      get(`/v1/crons?viewer=${encodeURIComponent(TELEMETRY_PRINCIPAL)}`),
     ]);
     const projects = ((projectsBody as { projects?: { name?: string; scopeId?: string }[] }).projects ?? []).filter(
       (p) => typeof p.name === "string" && p.name.startsWith("Agent · ") && typeof p.scopeId === "string",
     );
-    const crons = (cronsBody as { crons?: { ownerScopeId?: string; enabled?: boolean; nextFireAt?: number }[] }).crons ?? [];
+    const cronsPayload = cronsBody as {
+      crons?: { ownerScopeId?: string; enabled?: boolean; nextFireAt?: number }[];
+      visible?: { ownerScopeId?: string; enabled?: boolean; nextFireAt?: number }[];
+    };
+    const crons = [...(cronsPayload.crons ?? []), ...(cronsPayload.visible ?? [])];
     const agents: Record<string, { enabled: boolean; nextAt: string | null }> = {};
     for (const project of projects) {
       const key = project.name!.slice("Agent · ".length).trim().toLowerCase();
