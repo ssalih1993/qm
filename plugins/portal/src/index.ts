@@ -1,4 +1,5 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { createHash, timingSafeEqual } from "node:crypto";
 import { pathToFileURL } from "node:url";
 import { LRUCache } from "lru-cache";
 import {
@@ -58,6 +59,10 @@ const SESSION_RENEW_AFTER_S = Math.floor(SESSION_TTL_S / 2);
 const COOKIE_DOMAIN = process.env.PORTAL_COOKIE_DOMAIN || undefined;
 const APPS_DOMAIN = process.env.PORTAL_APPS_DOMAIN || undefined;
 const IS_PROD = process.env.NODE_ENV === "production";
+// Server-to-server telemetry for the CRM LIVE OFFICE page. Unset token =
+// endpoint does not exist (fail closed).
+const TELEMETRY_TOKEN = process.env.PORTAL_TELEMETRY_TOKEN;
+const TELEMETRY_PRINCIPAL = process.env.PORTAL_TELEMETRY_PRINCIPAL ?? "info@simplelend.co";
 const SECURE_COOKIES = PUBLIC_URL.startsWith("https://");
 const ORIGIN = (() => {
   try {
@@ -652,6 +657,65 @@ async function handleSecretDrop(
   return void res.end(bodyText);
 }
 
+function telemetryTokenValid(req: IncomingMessage): boolean {
+  if (!TELEMETRY_TOKEN) return false;
+  const header = req.headers.authorization ?? "";
+  const presented = header.startsWith("Bearer ") ? header.slice("Bearer ".length) : "";
+  if (!presented) return false;
+  const a = createHash("sha256").update(presented).digest();
+  const b = createHash("sha256").update(TELEMETRY_TOKEN).digest();
+  return timingSafeEqual(a, b);
+}
+
+/**
+ * Read-only agent schedule state for the CRM LIVE OFFICE page: for every
+ * "Agent · X" project, whether its cron is enabled and when it fires next.
+ * Bearer-token guarded; exposes no conversation content, no prompts, and no
+ * per-run data — only toggle state and timestamps.
+ */
+async function telemetryLiveOffice(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  if (!TELEMETRY_TOKEN || !PORTAL_IDENTITY_SECRET) return json(res, 404, { error: "not_found" });
+  if (!telemetryTokenValid(req)) return json(res, 401, { error: "unauthorized" });
+  try {
+    const identity = mintPortalIdentity({ p: TELEMETRY_PRINCIPAL, exp: Date.now() + 60_000 }, PORTAL_IDENTITY_SECRET);
+    const get = async (corePath: string): Promise<unknown> => {
+      const path = withSourceAuthNonce(corePath, CORE_SIGNING_SECRET);
+      const r = await fetch(`${CORE}${path}`, {
+        headers: { ...signedHeaders(CORE_SIGNING_SECRET, "GET", path), [PORTAL_IDENTITY_HEADER]: identity },
+        signal: AbortSignal.timeout(4_000),
+      });
+      if (!r.ok) throw new Error(`core ${corePath}: HTTP ${r.status}`);
+      return r.json();
+    };
+    const [projectsBody, cronsBody] = await Promise.all([
+      get(`/v1/projects?principalId=${encodeURIComponent(TELEMETRY_PRINCIPAL)}`),
+      get("/v1/crons"),
+    ]);
+    const projects = ((projectsBody as { projects?: { name?: string; scopeId?: string }[] }).projects ?? []).filter(
+      (p) => typeof p.name === "string" && p.name.startsWith("Agent · ") && typeof p.scopeId === "string",
+    );
+    const crons = (cronsBody as { crons?: { ownerScopeId?: string; enabled?: boolean; nextFireAt?: number }[] }).crons ?? [];
+    const agents: Record<string, { enabled: boolean; nextAt: string | null }> = {};
+    for (const project of projects) {
+      const key = project.name!.slice("Agent · ".length).trim().toLowerCase();
+      const owned = crons.filter((c) => c.ownerScopeId === project.scopeId);
+      const enabled = owned.some((c) => c.enabled === true);
+      const nextTimes = owned
+        .filter((c) => c.enabled === true && typeof c.nextFireAt === "number")
+        .map((c) => c.nextFireAt!) as number[];
+      agents[key] = {
+        enabled,
+        nextAt: nextTimes.length ? new Date(Math.min(...nextTimes)).toISOString() : null,
+      };
+    }
+    res.setHeader("cache-control", "no-store");
+    return json(res, 200, { asOf: new Date().toISOString(), agents });
+  } catch (err) {
+    console.error("[portal] telemetry/live-office failed:", errMessage(err));
+    return json(res, 502, { error: "upstream_unavailable" });
+  }
+}
+
 async function handleSelfConnect(res: ServerResponse, o: { provider: string; session: SessionClaims }): Promise<void> {
   const redirectUri = `${PUBLIC_URL}/v1/connectors/oauth/${encodeURIComponent(o.provider)}/callback`;
   const qs = new URLSearchParams({ principalId: o.session.sub, redirectUri, returnTo: "/connectors" });
@@ -841,6 +905,8 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
   void refreshSurfaceConfig();
 
   if (method === "GET" && pathname === "/healthz") return json(res, 200, { ok: true });
+
+  if (method === "GET" && pathname === "/telemetry/live-office") return telemetryLiveOffice(req, res);
 
   if (method === "GET" && (pathname === "/favicon.ico" || pathname === "/favicon.svg")) {
     return serveEmojiFavicon(res, process.env.PORTAL_FAVICON_EMOJI ?? "\u{1F3F4}\u{200D}\u2620\uFE0F", "max-age=86400");
